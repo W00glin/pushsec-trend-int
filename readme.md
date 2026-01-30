@@ -18,10 +18,11 @@ This tool polls the **[Push Security REST API](https://pushsecurity.com/help/aud
 - On‑prem deployment (no cloud compute or SOAR required)
 
 ## To Do -
-- [ ] Re-work API key so it is not hardcoded, use Windows Credential Manager
+- [X] Re-work API key so it is not hardcoded, use Windows Credential Manager
 - [ ] Expand ingest scope (Findings, Apps, etc)
 - [ ] *Nix option for non-Windows environments
 - [ ] Documentation for adding it as a scheduled task to run
+- [ ] Retry for network latency/hiccups
 ---
 
 ## Architecture (at a glance)
@@ -73,7 +74,7 @@ Edit the User Configuration section at the top of the script:
 - LogFilePath = `C:\ProgramData\PushToTrend\run.log`
 - LookbackMinutes = `10`
 
-### API Key Handling (Recommended)
+### API Key Handling (Testing only)
 Instead of hard‑coding the API key, set it as an environment variable for the account running the script:
 
 Set the environment variable `PUSH_API_TOKEN` to your key.
@@ -84,9 +85,21 @@ $env:PUSH_API_TOKEN = '<YOUR_PUSH_API_KEY>'
 ```
 To test and confirm that is working, you should then run:
 ```powershell
-echo $
+echo $env
 ```
 And the output should match the PSK you just entered.
+
+#### Windows Credential Manager (Recommended option)
+To avoid having hardcoded credentials in the script, or to having the API live in the `$env` consider leveraging the Windows Credential Manage with a dedciated service account and limiting its permissions. To add the API key as a `Generic Credential` under the Windows Credential Manager do the following:
+- Log on as DOMAIN\svc_PushTrend (temporarily), or open a process as that account.
+- Save a Generic Credential into that user’s Windows Credential Manager:
+```
+Target (name): PushSecurity.ApiKey
+User name field: can be a static label like api_key ( this is not going to be used)
+Password/secret: your Push API key (read‑only is fine)
+```
+- Close the session; the secret is now DPAPI‑protected under that profile.
+
 ---
 ## First Run (Backfill)
 For the initial run, perform a backfill to pull historical detections and validate the entire pipeline.
