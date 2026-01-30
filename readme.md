@@ -82,7 +82,11 @@ Examples -
 ```
 $env:PUSH_API_TOKEN = '<YOUR_PUSH_API_KEY>'
 ```
-
+To test and confirm that is working, you should then run:
+```powershell
+echo $
+```
+And the output should match the PSK you just entered.
 ---
 ## First Run (Backfill)
 For the initial run, perform a backfill to pull historical detections and validate the entire pipeline.
