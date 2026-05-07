@@ -13,22 +13,20 @@ $ErrorActionPreference = 'Stop'
 
 # -------------------- USER CONFIGURATION --------------------
 $PushApiBaseUrl     = 'https://api.pushsecurity.com/v1'       # REST v1
-$PushApiKey         = ''                                      # Optional fallback (lab only). Prefer CredMan or $env:PUSH_API_TOKEN
-$ServiceGatewayHost = '127.0.0.1'                             # Service Gateway IP/FQDN
-$ServiceGatewayPort = 6531                                    # CEF/TCP (use 6514 for TLS when ready)
-$StateFilePath      = 'C:\ProgramData\PushToTrend\state.json' # Persists last poll time (UTC)
-$LogFilePath        = 'C:\ProgramData\PushToTrend\run.log'    # Operational log
-$LookbackMinutes    = 10                                      # Used when no state yet
-$PageLimit          = 200                                     # Push page size
-$MaxPages           = 20                                      # Safety cap (avoid very long runs)
+$PushApiKey         = 'REDACTED'
+$ServiceGatewayHost = '127.0.0.1'
+$ServiceGatewayPort = 6531
+$StateFilePath      = 'C:\ProgramData\PushToTrend\state.json'
+$LogFilePath        = 'C:\ProgramData\PushToTrend\run.log'
+$LookbackMinutes    = 10
+$PageLimit          = 500
+$MaxPages           = 20
 $TimeoutSeconds     = 30
 # ------------------------------------------------------------
 
-# Ensure folders exist (state + log)
 $null = New-Item -ItemType Directory -Path (Split-Path $StateFilePath) -Force -ErrorAction SilentlyContinue
 $null = New-Item -ItemType Directory -Path (Split-Path $LogFilePath)  -Force -ErrorAction SilentlyContinue
 
-# ---- Logging ----
 function Write-Log {
     param([string]$Msg, [string]$Level='INFO')
     try {
@@ -37,115 +35,6 @@ function Write-Log {
     } catch {}
 }
 
-# ===================== Windows Credential Manager Helpers =====================
-# C# P/Invoke for CredRead/CredFree (no 'using' placement issues)
-Add-Type -Language CSharp -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-public struct NATIVE_CREDENTIAL
-{
-    public UInt32 Flags;
-    public UInt32 Type;
-    public string TargetName;
-    public string Comment;
-    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
-    public UInt32 CredentialBlobSize;
-    public IntPtr CredentialBlob;
-    public UInt32 Persist;
-    public UInt32 AttributeCount;
-    public IntPtr Attributes;
-    public string TargetAlias;
-    public string UserName;
-}
-
-public static class NativeCredMan
-{
-    [DllImport("Advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern bool CredRead(string target, UInt32 type, UInt32 reservedFlag, out IntPtr credentialPtr);
-
-    [DllImport("Advapi32.dll", SetLastError=true)]
-    public static extern bool CredFree(IntPtr cred);
-}
-"@
-
-function Get-CredentialManagerSecret {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$true)][string]$TargetName  # e.g. 'PushSecurity.ApiKey'
-    )
-    $CRED_TYPE_GENERIC = [uint32]1
-    $ptr = [IntPtr]::Zero
-    try {
-        $ok = [NativeCredMan]::CredRead($TargetName, $CRED_TYPE_GENERIC, 0, [ref]$ptr)
-        if (-not $ok -or $ptr -eq [IntPtr]::Zero) { return $null }
-
-        # PS 5.1-friendly PtrToStructure overload
-        $cred = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [NATIVE_CREDENTIAL])
-
-        if ($cred.CredentialBlobSize -le 0 -or $cred.CredentialBlob -eq [IntPtr]::Zero) { return $null }
-
-        $bytes = New-Object byte[] ($cred.CredentialBlobSize)
-        [System.Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $cred.CredentialBlobSize)
-
-        # Generic credential blobs are UTF-16 (Unicode)
-        $secret = [System.Text.Encoding]::Unicode.GetString($bytes).TrimEnd([char]0)
-        return $secret
-    }
-    finally {
-        if ($ptr -ne [IntPtr]::Zero) {
-            [NativeCredMan]::CredFree($ptr) | Out-Null
-        }
-    }
-}
-
-function Get-PushApiKey {
-    <#
-      Resolution order:
-        1) Windows Credential Manager (Generic) => Target: 'PushSecurity.ApiKey'
-        2) Environment variable $env:PUSH_API_TOKEN
-        3) Script variable $PushApiKey (hardcoded fallback)
-      Logs the chosen source; never logs the secret itself.
-    #>
-    [CmdletBinding()]
-    param(
-        [string]$CredTargetName = 'PushSecurity.ApiKey'
-    )
-
-    # 1) Credential Manager (per-user vault of the Scheduled Task identity)
-    try {
-        $fromCred = Get-CredentialManagerSecret -TargetName $CredTargetName
-        if (-not [string]::IsNullOrWhiteSpace($fromCred)) {
-            Write-Log "API key source: CredentialManager ($CredTargetName)"
-            return $fromCred
-        } else {
-            Write-Log "CredentialManager target '$CredTargetName' not found for current user." 'WARN'
-        }
-    } catch {
-        Write-Log ("CredentialManager read error: {0}" -f $_.Exception.Message) 'WARN'
-    }
-
-    # 2) Environment variable
-    if (-not [string]::IsNullOrWhiteSpace($env:PUSH_API_TOKEN)) {
-        Write-Log "API key source: Environment (PUSH_API_TOKEN)"
-        return $env:PUSH_API_TOKEN
-    } else {
-        Write-Log "Environment variable PUSH_API_TOKEN not set." 'WARN'
-    }
-
-    # 3) Script variable fallback (lab/testing)
-    if (-not [string]::IsNullOrWhiteSpace($script:PushApiKey)) {
-        Write-Log "API key source: Script variable (`$PushApiKey). Consider migrating to CredMan or env for security."
-        return $script:PushApiKey
-    }
-
-    Write-Log "No API key found via Credential Manager, environment, or script variable. Aborting." 'ERROR'
-    return $null
-}
-# =================== End Credential Manager + Resolver ========================
-
-# ---- State ----
 function Get-LastTimestampUtc {
     if (Test-Path $StateFilePath) {
         try {
@@ -158,26 +47,26 @@ function Get-LastTimestampUtc {
     }
     return (Get-Date).ToUniversalTime().AddMinutes(-$LookbackMinutes)
 }
+
 function Set-LastTimestampUtc([DateTime]$dt) {
     @{ lastPollUtc = $dt.ToString('o') } |
         ConvertTo-Json |
         Set-Content -Path $StateFilePath -Encoding UTF8
 }
 
-# ---- Helpers ----
 function UnixSeconds([DateTime]$dt) {
     return [int][Math]::Floor( ($dt.ToUniversalTime() - [DateTime]'1970-01-01T00:00:00Z').TotalSeconds )
 }
-function Convert-ToCefEscaped {
-    [CmdletBinding()]
-    param([string]$Value)
-    if ($null -eq $Value) { return '' }
-    $v = $Value -replace '\\', '\\\\'
+
+function CefEscape([string]$v) {
+    if ($null -eq $v) { return '' }
+    $v = $v -replace '\\', '\\\\'
     $v = $v -replace '\|', '\|'
     $v = $v -replace '=', '\='
     return $v
 }
-function Convert-SeverityToCef([string]$s) {
+
+function SeverityToCef([string]$s) {
     if ([string]::IsNullOrWhiteSpace($s)) { $s = 'MEDIUM' }
     switch ($s.ToUpperInvariant()) {
         'LOW'      { 3 }
@@ -188,17 +77,13 @@ function Convert-SeverityToCef([string]$s) {
     }
 }
 
-# ---- Syslog (CEF/TCP) ----
-function Send-SyslogTcp([string]$Message) {
-    # Facility 16 (local0) -> 16*8=128; Severity 6 (informational) -> 6; PRI=<134>
+function Send-SyslogTcp([string]$msg) {
     $pri = '<134>'
     $hdr = "{0} {1}" -f (Get-Date -Format 'MMM dd HH:mm:ss'), $env:COMPUTERNAME
-    $payload = "$pri$hdr $Message`n"
+    $payload = "$pri$hdr $msg`n"
     $client = $null
     try {
         $client = New-Object System.Net.Sockets.TcpClient
-        $client.SendTimeout    = 5000
-        $client.ReceiveTimeout = 5000
         $client.Connect($ServiceGatewayHost, $ServiceGatewayPort)
         $bytes  = [Text.Encoding]::UTF8.GetBytes($payload)
         $stream = $client.GetStream()
@@ -209,54 +94,75 @@ function Send-SyslogTcp([string]$Message) {
     }
 }
 
-# ---- CEF builder for Push detections ----
-function New-CefMessage {
-    [CmdletBinding()]
-    param($Detection)
+function Get-PushDetectionDetail($id, $headers) {
+    try {
+        $url = "$PushApiBaseUrl/detections/$id"
+        return Invoke-RestMethod -Method GET -Uri $url -Headers $headers -TimeoutSec $TimeoutSeconds
+    } catch {
+        Write-Log ("Failed to get details for {0}: {1}" -f $id, $_.Exception.Message) 'WARN'
+        return $null
+    }
+}
 
-    $sev = Convert-SeverityToCef $Detection.severity
+function Build-Cef($detection) {
+    $sev = SeverityToCef $detection.severity
 
     $rt = $null
-    if ($Detection.creationTimestamp -is [int]) {
-        $rt = ([DateTime]'1970-01-01Z').AddSeconds($Detection.creationTimestamp).ToUniversalTime().ToString('o')
+    if ($detection.creationTimestamp -is [int]) {
+        $rt = ([DateTime]'1970-01-01Z').AddSeconds($detection.creationTimestamp).ToUniversalTime().ToString('o')
     }
 
-    # detectionType becomes the event "name"
-    $hdr = "CEF:0|Push Security|SaaS Identity Security|1.0|PUSH_DETECTION|{0}|{1}|" -f (Convert-ToCefEscaped $Detection.detectionType), $sev
+    $hdr = "CEF:0|Push Security|SaaS Identity Security|1.0|PUSH_DETECTION|{0}|{1}|" -f (CefEscape $detection.detectionType), $sev
 
     $ext = @()
-    if ($Detection.id) { $ext += "externalId=$(Convert-ToCefEscaped $Detection.id)" }
-    if ($rt)           { $ext += "rt=$(Convert-ToCefEscaped $rt)" }
-    if ($Detection.response) {
-        $ext += "cs5Label=Response cs5=$(Convert-ToCefEscaped $Detection.response)"
+
+    if ($detection.id) { $ext += "externalId=$(CefEscape $detection.id)" }
+    if ($rt)           { $ext += "rt=$(CefEscape $rt)" }
+    if ($detection.browserId) { $ext += "deviceExternalId=$(CefEscape $detection.browserId)" }
+
+    if ($detection.employee) {
+        if ($detection.employee.email)     { $ext += "cs1Label=User cs1=$(CefEscape $detection.employee.email)" }
+        if ($detection.employee.firstName) { $ext += "cs2Label=FirstName cs2=$(CefEscape $detection.employee.firstName)" }
+        if ($detection.employee.lastName)  { $ext += "cs3Label=LastName cs3=$(CefEscape $detection.employee.lastName)" }
+        if ($detection.employee.department){ $ext += "cs4Label=Department cs4=$(CefEscape $detection.employee.department)" }
+        if ($detection.employee.location)  { $ext += "cs7Label=Location cs7=$(CefEscape $detection.employee.location)" }
     }
-    if ($null -ne $Detection.archived) {
-        $ext += "cs6Label=Archived cs6=$(Convert-ToCefEscaped ([string]$Detection.archived))"
+
+    if ($detection.response) {
+        $ext += "cs5Label=Response cs5=$(CefEscape $detection.response)"
     }
-    if ($Detection.employee -and $Detection.employee.email) {
-        $ext += "cs1Label=User cs1=$(Convert-ToCefEscaped $Detection.employee.email)"
+
+    if ($null -ne $detection.archived) {
+        $ext += "cs6Label=Archived cs6=$(CefEscape ([string]$detection.archived))"
+    }
+
+    # ✅ FIX: Always include msg field
+    $summary = "{0} - {1}" -f $detection.detectionType, $detection.response
+    $ext += "msg=$(CefEscape $summary)"
+
+    # ✅ FIX: Use ONLY the first event (avoid duplicate keys)
+    $ev = $detection.events | Select-Object -First 1
+    if ($ev) {
+        if ($ev.url)              { $ext += "request=$(CefEscape $ev.url)" }
+        if ($ev.sourceIpAddress)  { $ext += "src=$(CefEscape $ev.sourceIpAddress)" }
+        if ($ev.extensionName)    { $ext += "cs8Label=Extension cs8=$(CefEscape $ev.extensionName)" }
+        if ($ev.phishingToolIndicator) { $ext += "cs9Label=PhishingTool cs9=$(CefEscape $ev.phishingToolIndicator)" }
+        if ($ev.referrerUrl)      { $ext += "cs10Label=Referrer cs10=$(CefEscape $ev.referrerUrl)" }
+    }
+
+    # ✅ FIX: Preserve all URLs safely in ONE field
+    $allUrls = ($detection.events | Where-Object { $_.url } | Select-Object -ExpandProperty url) -join ","
+    if ($allUrls) {
+        $ext += "cs11Label=AllUrls cs11=$(CefEscape $allUrls)"
     }
 
     return $hdr + ($ext -join ' ')
 }
 
-# Track last API pull success for state advancement
 $script:LastPullSucceeded = $false
 
-# ---- Pull detections with paging ----
-function Get-PushDetections([DateTime]$sinceUtc) {
+function Get-PushDetections([DateTime]$sinceUtc, $headers) {
     $script:LastPullSucceeded = $false
-
-    # Resolve API key via CredMan -> env -> script variable
-    $key = Get-PushApiKey
-    if ([string]::IsNullOrWhiteSpace($key)) {
-        return ,@()  # error already logged in resolver
-    }
-
-    $headers = @{
-        'x-api-key' = $key
-        'Accept'    = 'application/json'
-    }
 
     $sinceUnix = UnixSeconds $sinceUtc
     $nextToken = $null
@@ -265,44 +171,24 @@ function Get-PushDetections([DateTime]$sinceUtc) {
 
     do {
         $page++
-        if ($page -gt $MaxPages) {
-            Write-Log "Pagination stop: reached $MaxPages pages." 'WARN'
-            break
-        }
+        if ($page -gt $MaxPages) { break }
 
-        # Build query
-        # Add optional server-side filters here, e.g.:
-        #   $qs += "&severity=HIGH"
-        #   $qs += "&archived=false"
-        #   $qs += "&detectionType=PHISHING"
         $qs = "creationTimestampAfter=$sinceUnix&limit=$PageLimit"
         if ($nextToken) { $qs += "&nextToken=$([uri]::EscapeDataString($nextToken))" }
 
         $url = "$PushApiBaseUrl/detections?$qs"
-        # Write-Log ("GET {0}" -f $url)  # uncomment to troubleshoot
 
         try {
             $resp = Invoke-RestMethod -Method GET -Uri $url -Headers $headers -TimeoutSec $TimeoutSeconds
         } catch {
-            # Add status + body to logs to ease debugging
-            $statusCode = $null
-            $body       = $null
-            if ($_.Exception.Response) {
-                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-                try {
-                    $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                    $body = $sr.ReadToEnd()
-                    $sr.Close()
-                } catch {}
-            }
-            Write-Log ("Push API error: Status={0} Body={1} Error={2}" -f $statusCode, $body, $_.Exception.Message) 'ERROR'
+            Write-Log "Push API error: $_" 'ERROR'
             return ,$all
         }
 
         if ($resp.result) { $all += $resp.result }
 
-        if ($resp.paging -and $resp.paging.moreResults -eq $true -and $resp.paging.nextToken) {
-            $nextToken = [string]$resp.paging.nextToken
+        if ($resp.paging -and $resp.paging.moreResults -and $resp.paging.nextToken) {
+            $nextToken = $resp.paging.nextToken
         } else {
             $nextToken = $null
         }
@@ -313,46 +199,37 @@ function Get-PushDetections([DateTime]$sinceUtc) {
     return ,$all
 }
 
-# --------------------------- MAIN ---------------------------
 Write-Log "Run started."
 
-# Determine the effective start time
+$key = if (-not [string]::IsNullOrWhiteSpace($env:PUSH_API_TOKEN)) { $env:PUSH_API_TOKEN } else { $PushApiKey }
+$headers = @{ 'x-api-key' = $key; 'Accept'='application/json' }
+
 if ($BackfillHours -gt 0) {
     $effectiveUtc = (Get-Date).ToUniversalTime().AddHours(-$BackfillHours)
-    Write-Log ("Backfill mode: last {0}h starting {1}" -f $BackfillHours, $effectiveUtc.ToString('o'))
 } else {
     $effectiveUtc = Get-LastTimestampUtc
-    Write-Log ("Polling from UTC {0}" -f $effectiveUtc.ToString('o'))
 }
 
-# Skew guard: never query "into the future"
 $nowUtc = (Get-Date).ToUniversalTime()
-if ($effectiveUtc -gt $nowUtc) {
-    $effectiveUtc = $nowUtc.AddMinutes(-$LookbackMinutes)
-    Write-Log "Adjusted effectiveUtc to now - lookback (skew guard)."
-}
 
-# Pull detections and forward
-$detections = Get-PushDetections $effectiveUtc
-Write-Log ("Fetched {0} detections." -f $detections.Count)
+$detections = Get-PushDetections $effectiveUtc $headers
 
 $sent = 0
 foreach ($d in $detections) {
     try {
-        $cef = New-CefMessage -Detection $d
-        Send-SyslogTcp -Message $cef
+        $full = Get-PushDetectionDetail $d.id $headers
+        if ($full) { $d = $full }
+
+        $cef = Build-Cef $d
+        Send-SyslogTcp $cef
         $sent++
     } catch {
-        Write-Log ("Failed to process detection {0}: {1}" -f $d.id, $_.Exception.Message) 'WARN'
+        Write-Log ("Failed detection {0}" -f $d.id) 'WARN'
     }
 }
 
-# Advance state only if not backfilling and the last API pull succeeded
 if ($BackfillHours -eq 0 -and $script:LastPullSucceeded) {
     Set-LastTimestampUtc $nowUtc
-    Write-Log "State advanced."
-} else {
-    if ($BackfillHours -gt 0) { Write-Log "Backfill run: state not advanced." }
 }
 
 Write-Log ("Run completed. Forwarded {0} detections." -f $sent)
