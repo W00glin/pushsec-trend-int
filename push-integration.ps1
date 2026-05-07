@@ -13,14 +13,14 @@ $ErrorActionPreference = 'Stop'
 
 # -------------------- USER CONFIGURATION --------------------
 $PushApiBaseUrl     = 'https://api.pushsecurity.com/v1'       # REST v1
-$PushApiKey         = 'REDACTED'
-$ServiceGatewayHost = '127.0.0.1'
-$ServiceGatewayPort = 6531
-$StateFilePath      = 'C:\ProgramData\PushToTrend\state.json'
-$LogFilePath        = 'C:\ProgramData\PushToTrend\run.log'
-$LookbackMinutes    = 10
-$PageLimit          = 500
-$MaxPages           = 20
+$PushApiKey         = 'REDACTED'                              # API key, optional, do not use for production
+$ServiceGatewayHost = '127.0.0.1'                             # Service Gateway IP/FQDN
+$ServiceGatewayPort = 6531                                    # CEF/TCP (use 6514 for TLS when ready)
+$StateFilePath      = 'C:\ProgramData\PushToTrend\state.json' # Persists last poll time (UTC)
+$LogFilePath        = 'C:\ProgramData\PushToTrend\run.log'    # Operational log
+$LookbackMinutes    = 10                                      # Used when no state yet
+$PageLimit          = 500                                     # Push page size
+$MaxPages           = 20                                      # Safety cap (avoid very long runs)
 $TimeoutSeconds     = 30
 # ------------------------------------------------------------
 
